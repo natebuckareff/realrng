@@ -19,6 +19,8 @@ use rayon::prelude::*;
 
 const RANDOM_OUTPUT_BYTES_PER_DIFF: usize = 32;
 const RANDOM_HISTORY_LIMIT: usize = 2048;
+const CHI_SQUARE_CHUNK_SIZE: usize = 4096;
+const CHI_SQUARE_HISTORY_LIMIT: usize = 256;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -62,18 +64,28 @@ struct WebcamWindow {
     default_pos: egui::Pos2,
     diff_default_pos: egui::Pos2,
     random_default_pos: egui::Pos2,
+    diff_chi_square_default_pos: egui::Pos2,
+    random_chi_square_default_pos: egui::Pos2,
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
     stream: Option<CameraStream>,
     texture: Option<egui::TextureHandle>,
     diff_texture: Option<egui::TextureHandle>,
     random_history: VecDeque<u8>,
+    diff_chi_square: ChiSquareTracker,
+    random_chi_square: ChiSquareTracker,
     status: String,
 }
 
 struct RgbFrame {
     size: [usize; 2],
     pixels: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ChiSquareTracker {
+    pending: Vec<u8>,
+    z_scores: VecDeque<f64>,
 }
 
 struct CameraStream {
@@ -100,12 +112,16 @@ impl WebcamWindow {
             default_pos: egui::pos2(48.0, 56.0),
             diff_default_pos: egui::pos2(600.0, 56.0),
             random_default_pos: egui::pos2(48.0, 520.0),
+            diff_chi_square_default_pos: egui::pos2(600.0, 520.0),
+            random_chi_square_default_pos: egui::pos2(48.0, 820.0),
             devices: Vec::new(),
             selected_device: None,
             stream: None,
             texture: None,
             diff_texture: None,
             random_history: VecDeque::with_capacity(RANDOM_HISTORY_LIMIT),
+            diff_chi_square: ChiSquareTracker::default(),
+            random_chi_square: ChiSquareTracker::default(),
             status: String::new(),
         };
 
@@ -122,6 +138,20 @@ impl WebcamWindow {
         self.show_webcam_window(ctx);
         self.show_difference_window(ctx);
         self.show_random_window(ctx);
+        self.show_chi_square_window(
+            ctx,
+            "Raw Difference Chi-Square",
+            "raw_difference_chi_square_window",
+            self.diff_chi_square_default_pos,
+            &self.diff_chi_square,
+        );
+        self.show_chi_square_window(
+            ctx,
+            "BLAKE3 Output Chi-Square",
+            "blake3_output_chi_square_window",
+            self.random_chi_square_default_pos,
+            &self.random_chi_square,
+        );
     }
 
     fn show_webcam_window(&mut self, ctx: &egui::Context) {
@@ -189,6 +219,25 @@ impl WebcamWindow {
                         },
                     );
                 }
+            });
+    }
+
+    fn show_chi_square_window(
+        &self,
+        ctx: &egui::Context,
+        title: &str,
+        id: &'static str,
+        default_pos: egui::Pos2,
+        tracker: &ChiSquareTracker,
+    ) {
+        egui::Window::new(title)
+            .id(egui::Id::new(id))
+            .default_pos(default_pos)
+            .default_size([520.0, 260.0])
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                chi_square_graph(ui, tracker);
             });
     }
 
@@ -347,6 +396,8 @@ impl WebcamWindow {
         self.texture = None;
         self.diff_texture = None;
         self.random_history.clear();
+        self.diff_chi_square.clear();
+        self.random_chi_square.clear();
         self.status = "Starting camera...".to_owned();
     }
 
@@ -358,6 +409,8 @@ impl WebcamWindow {
         self.texture = None;
         self.diff_texture = None;
         self.random_history.clear();
+        self.diff_chi_square.clear();
+        self.random_chi_square.clear();
     }
 
     fn drain_stream_messages(&mut self, ctx: &egui::Context) {
@@ -413,6 +466,7 @@ impl WebcamWindow {
         }
 
         if let Some(diff_pixels) = frame.diff_pixels {
+            self.diff_chi_square.push_bytes(&diff_pixels);
             let diff_image = egui::ColorImage::from_rgb(frame.size, &diff_pixels);
 
             if let Some(texture) = self.diff_texture.as_mut() {
@@ -429,6 +483,7 @@ impl WebcamWindow {
         }
 
         if let Some(random_bytes) = frame.random_bytes {
+            self.random_chi_square.push_bytes(&random_bytes);
             self.push_random_bytes(&random_bytes);
         }
     }
@@ -441,6 +496,169 @@ impl WebcamWindow {
             self.random_history.push_back(*byte);
         }
     }
+}
+
+impl ChiSquareTracker {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+
+        while self.pending.len() >= CHI_SQUARE_CHUNK_SIZE {
+            let chunk = self
+                .pending
+                .drain(..CHI_SQUARE_CHUNK_SIZE)
+                .collect::<Vec<_>>();
+            let z_score = byte_frequency_z_score(&chunk);
+
+            if self.z_scores.len() == CHI_SQUARE_HISTORY_LIMIT {
+                self.z_scores.pop_front();
+            }
+            self.z_scores.push_back(z_score);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.z_scores.clear();
+    }
+}
+
+fn byte_frequency_z_score(bytes: &[u8]) -> f64 {
+    let mut counts = [0_usize; 256];
+    for byte in bytes {
+        counts[*byte as usize] += 1;
+    }
+
+    let expected = bytes.len() as f64 / 256.0;
+    let chi_square = counts
+        .iter()
+        .map(|count| {
+            let delta = *count as f64 - expected;
+            delta * delta / expected
+        })
+        .sum::<f64>();
+
+    let degrees_of_freedom = 255.0;
+    (chi_square - degrees_of_freedom) / (2.0_f64 * degrees_of_freedom).sqrt()
+}
+
+fn chi_square_graph(ui: &mut egui::Ui, tracker: &ChiSquareTracker) {
+    let z_scores = &tracker.z_scores;
+    let desired_size = egui::vec2(ui.available_width(), 210.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let (min_z, max_z) = chi_square_y_range(z_scores);
+
+    for z in [-5.0_f64, -3.0, 0.0, 3.0, 5.0] {
+        if z < min_z || z > max_z {
+            continue;
+        }
+
+        let y = z_to_y(rect, z, min_z, max_z);
+        let color = if z == 0.0 {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        } else {
+            ui.visuals()
+                .widgets
+                .noninteractive
+                .bg_stroke
+                .color
+                .linear_multiply(0.45)
+        };
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+
+    let label = match z_scores.back() {
+        Some(z_score) => format!(
+            "samples: {}  latest z: {:.2}  pending: {}/{} bytes",
+            z_scores.len(),
+            z_score,
+            tracker.pending.len(),
+            CHI_SQUARE_CHUNK_SIZE
+        ),
+        None => format!(
+            "samples: 0  pending: {}/{} bytes",
+            tracker.pending.len(),
+            CHI_SQUARE_CHUNK_SIZE
+        ),
+    };
+
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+
+    if z_scores.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("Waiting for {} bytes per chunk.", CHI_SQUARE_CHUNK_SIZE),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    }
+
+    if z_scores.len() == 1 {
+        let y = z_to_y(rect, *z_scores.front().unwrap(), min_z, max_z);
+        painter.circle_filled(
+            rect.center_top() + egui::vec2(0.0, y - rect.top()),
+            3.0,
+            egui::Color32::from_rgb(120, 180, 255),
+        );
+        return;
+    }
+
+    let last_index = (z_scores.len() - 1) as f32;
+    let points = z_scores
+        .iter()
+        .enumerate()
+        .map(|(idx, z_score)| {
+            let x = egui::lerp(rect.left()..=rect.right(), idx as f32 / last_index);
+            egui::pos2(x, z_to_y(rect, *z_score, min_z, max_z))
+        })
+        .collect::<Vec<_>>();
+
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 255)),
+    ));
+}
+
+fn chi_square_y_range(z_scores: &VecDeque<f64>) -> (f64, f64) {
+    let mut min_z = -6.0_f64;
+    let mut max_z = 6.0_f64;
+
+    for z_score in z_scores {
+        min_z = min_z.min(*z_score);
+        max_z = max_z.max(*z_score);
+    }
+
+    if (max_z - min_z).abs() < f64::EPSILON {
+        (min_z - 1.0, max_z + 1.0)
+    } else {
+        let padding = (max_z - min_z) * 0.08;
+        (min_z - padding, max_z + padding)
+    }
+}
+
+fn z_to_y(rect: egui::Rect, z_score: f64, min_z: f64, max_z: f64) -> f32 {
+    let fraction = ((z_score - min_z) / (max_z - min_z)) as f32;
+    egui::lerp(rect.bottom()..=rect.top(), fraction)
 }
 
 fn absolute_frame_difference(current: &[u8], previous: &[u8]) -> Vec<u8> {
