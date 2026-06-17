@@ -76,6 +76,7 @@ struct WebcamWindow {
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
     selected_frame_format: FrameFormat,
+    component_selections: ComponentSelections,
     stream: Option<CameraStream>,
     texture: Option<egui::TextureHandle>,
     diff_texture: Option<egui::TextureHandle>,
@@ -83,9 +84,45 @@ struct WebcamWindow {
     status: String,
 }
 
-struct RgbFrame {
+struct CapturedFrame {
     size: [usize; 2],
     pixels: Vec<u8>,
+    components: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ComponentSelections {
+    yuyv: YuvComponents,
+    nv12: Nv12Components,
+    gray: GrayComponents,
+    mjpeg: RgbComponents,
+    raw_rgb: RgbComponents,
+    raw_bgr: RgbComponents,
+}
+
+#[derive(Clone, Copy)]
+struct YuvComponents {
+    y: bool,
+    u: bool,
+    v: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Nv12Components {
+    y: bool,
+    uv: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GrayComponents {
+    gray: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RgbComponents {
+    r: bool,
+    g: bool,
+    b: bool,
 }
 
 #[derive(Default)]
@@ -121,6 +158,7 @@ impl WebcamWindow {
             devices: Vec::new(),
             selected_device: None,
             selected_frame_format: FrameFormat::YUYV,
+            component_selections: ComponentSelections::default(),
             stream: None,
             texture: None,
             diff_texture: None,
@@ -184,6 +222,10 @@ impl WebcamWindow {
                     {
                         self.stop_camera();
                     }
+                });
+
+                ui.add_enabled_ui(self.stream.is_none(), |ui| {
+                    self.component_selector(ui);
                 });
 
                 if !self.status.is_empty() {
@@ -277,6 +319,40 @@ impl WebcamWindow {
             });
     }
 
+    fn component_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| match self.selected_frame_format {
+            FrameFormat::YUYV => {
+                ui.label("Extract");
+                ui.checkbox(&mut self.component_selections.yuyv.y, "Y");
+                ui.checkbox(&mut self.component_selections.yuyv.u, "U");
+                ui.checkbox(&mut self.component_selections.yuyv.v, "V");
+            }
+            FrameFormat::NV12 => {
+                ui.label("Extract");
+                ui.checkbox(&mut self.component_selections.nv12.y, "Y");
+                ui.checkbox(&mut self.component_selections.nv12.uv, "UV");
+            }
+            FrameFormat::GRAY => {
+                ui.label("Extract");
+                ui.checkbox(&mut self.component_selections.gray.gray, "Gray");
+            }
+            FrameFormat::MJPEG => {
+                ui.label("Extract decoded");
+                rgb_component_checkboxes(ui, &mut self.component_selections.mjpeg);
+            }
+            FrameFormat::RAWRGB => {
+                ui.label("Extract");
+                rgb_component_checkboxes(ui, &mut self.component_selections.raw_rgb);
+            }
+            FrameFormat::RAWBGR => {
+                ui.label("Extract");
+                ui.checkbox(&mut self.component_selections.raw_bgr.b, "B");
+                ui.checkbox(&mut self.component_selections.raw_bgr.g, "G");
+                ui.checkbox(&mut self.component_selections.raw_bgr.r, "R");
+            }
+        });
+    }
+
     fn frame_view(&self, ui: &mut egui::Ui) {
         if let Some(texture) = &self.texture {
             ui.add(
@@ -333,6 +409,7 @@ impl WebcamWindow {
         let camera_index = device.index().clone();
         let camera_label = device_label(device);
         let frame_format = self.selected_frame_format;
+        let component_selections = self.component_selections;
 
         self.stop_camera();
 
@@ -343,6 +420,7 @@ impl WebcamWindow {
             camera_index,
             camera_label,
             frame_format,
+            component_selections,
             stop_signal.clone(),
             sender,
         );
@@ -439,6 +517,39 @@ impl WebcamWindow {
             self.diff_texture = None;
         }
     }
+}
+
+impl Default for ComponentSelections {
+    fn default() -> Self {
+        Self {
+            yuyv: YuvComponents {
+                y: true,
+                u: false,
+                v: false,
+            },
+            nv12: Nv12Components { y: true, uv: false },
+            gray: GrayComponents { gray: true },
+            mjpeg: RgbComponents::all(),
+            raw_rgb: RgbComponents::all(),
+            raw_bgr: RgbComponents::all(),
+        }
+    }
+}
+
+impl RgbComponents {
+    fn all() -> Self {
+        Self {
+            r: true,
+            g: true,
+            b: true,
+        }
+    }
+}
+
+fn rgb_component_checkboxes(ui: &mut egui::Ui, components: &mut RgbComponents) {
+    ui.checkbox(&mut components.r, "R");
+    ui.checkbox(&mut components.g, "G");
+    ui.checkbox(&mut components.b, "B");
 }
 
 impl ChiSquareTracker {
@@ -633,6 +744,83 @@ fn extract_lsb_transition_bytes(current: &[u8], previous: &[u8]) -> Vec<u8> {
     packer.finish()
 }
 
+fn extract_component_bytes(
+    source_format: FrameFormat,
+    source_bytes: &[u8],
+    decoded_rgb: &[u8],
+    size: [usize; 2],
+    selections: &ComponentSelections,
+) -> Vec<u8> {
+    match source_format {
+        FrameFormat::YUYV => extract_yuyv_components(source_bytes, selections.yuyv),
+        FrameFormat::NV12 => extract_nv12_components(source_bytes, size, selections.nv12),
+        FrameFormat::GRAY => {
+            if selections.gray.gray {
+                source_bytes.to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+        FrameFormat::MJPEG => extract_rgb_components(decoded_rgb, selections.mjpeg),
+        FrameFormat::RAWRGB => extract_rgb_components(source_bytes, selections.raw_rgb),
+        FrameFormat::RAWBGR => extract_bgr_components(source_bytes, selections.raw_bgr),
+    }
+}
+
+fn extract_yuyv_components(bytes: &[u8], components: YuvComponents) -> Vec<u8> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, byte)| match idx % 4 {
+            0 | 2 if components.y => Some(*byte),
+            1 if components.u => Some(*byte),
+            3 if components.v => Some(*byte),
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_nv12_components(bytes: &[u8], size: [usize; 2], components: Nv12Components) -> Vec<u8> {
+    let y_len = size[0].saturating_mul(size[1]).min(bytes.len());
+    let mut extracted = Vec::with_capacity(bytes.len());
+
+    if components.y {
+        extracted.extend_from_slice(&bytes[..y_len]);
+    }
+
+    if components.uv {
+        extracted.extend_from_slice(&bytes[y_len..]);
+    }
+
+    extracted
+}
+
+fn extract_rgb_components(bytes: &[u8], components: RgbComponents) -> Vec<u8> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, byte)| match idx % 3 {
+            0 if components.r => Some(*byte),
+            1 if components.g => Some(*byte),
+            2 if components.b => Some(*byte),
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_bgr_components(bytes: &[u8], components: RgbComponents) -> Vec<u8> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, byte)| match idx % 3 {
+            0 if components.b => Some(*byte),
+            1 if components.g => Some(*byte),
+            2 if components.r => Some(*byte),
+            _ => None,
+        })
+        .collect()
+}
+
 struct BitPacker {
     bytes: Vec<u8>,
     byte: u8,
@@ -672,13 +860,21 @@ fn spawn_camera_worker(
     index: CameraIndex,
     label: String,
     source_format: FrameFormat,
+    component_selections: ComponentSelections,
     stop_signal: Arc<AtomicBool>,
     sender: mpsc::SyncSender<StreamMessage>,
 ) {
     let _ = std::thread::Builder::new()
         .name("camera-worker".to_owned())
         .spawn(move || {
-            run_camera_worker(index, label, source_format, stop_signal, sender);
+            run_camera_worker(
+                index,
+                label,
+                source_format,
+                component_selections,
+                stop_signal,
+                sender,
+            );
         });
 }
 
@@ -686,6 +882,7 @@ fn run_camera_worker(
     index: CameraIndex,
     label: String,
     source_format: FrameFormat,
+    component_selections: ComponentSelections,
     stop_signal: Arc<AtomicBool>,
     sender: mpsc::SyncSender<StreamMessage>,
 ) {
@@ -761,7 +958,7 @@ fn run_camera_worker(
         )),
     );
 
-    let mut previous_frame: Option<RgbFrame> = None;
+    let mut previous_frame: Option<CapturedFrame> = None;
 
     while !stop_signal.load(Ordering::Relaxed) {
         let frame_started_at = Instant::now();
@@ -790,25 +987,35 @@ fn run_camera_worker(
 
         let size = [decoded.width() as usize, decoded.height() as usize];
         let current_pixels = decoded.as_raw().to_vec();
+        let current_components = extract_component_bytes(
+            frame.source_frame_format(),
+            frame.buffer(),
+            &current_pixels,
+            size,
+            &component_selections,
+        );
 
         let (diff_pixels, extracted_noise_bytes) = previous_frame
             .as_ref()
             .filter(|previous| {
-                previous.size == size && previous.pixels.len() == current_pixels.len()
+                previous.size == size
+                    && previous.pixels.len() == current_pixels.len()
+                    && previous.components.len() == current_components.len()
             })
             .map(|previous| {
                 (
                     absolute_frame_difference(&current_pixels, &previous.pixels),
-                    extract_lsb_transition_bytes(&current_pixels, &previous.pixels),
+                    extract_lsb_transition_bytes(&current_components, &previous.components),
                 )
             })
             .map_or((None, None), |(diff_pixels, extracted_noise_bytes)| {
                 (Some(diff_pixels), Some(extracted_noise_bytes))
             });
 
-        previous_frame = Some(RgbFrame {
+        previous_frame = Some(CapturedFrame {
             size,
             pixels: current_pixels.clone(),
+            components: current_components,
         });
 
         send_stream_message(
