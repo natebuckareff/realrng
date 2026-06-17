@@ -129,8 +129,8 @@ impl WebcamWindow {
         self.show_difference_window(ctx);
         self.show_chi_square_window(
             ctx,
-            "LSB Transition Chi-Square",
-            "lsb_transition_chi_square_window",
+            "Von Neumann LSB Chi-Square",
+            "von_neumann_lsb_chi_square_window",
             self.diff_chi_square_default_pos,
             &self.diff_chi_square,
         );
@@ -574,27 +574,59 @@ fn absolute_frame_difference(current: &[u8], previous: &[u8]) -> Vec<u8> {
 }
 
 fn extract_lsb_transition_bytes(current: &[u8], previous: &[u8]) -> Vec<u8> {
-    let mut extracted = Vec::with_capacity(current.len().div_ceil(8));
-    let mut byte = 0_u8;
-    let mut bit_index = 0;
+    let mut packer = BitPacker::with_capacity(current.len() / 16);
+    let mut pending_bit = None;
 
     for (current, previous) in current.iter().zip(previous) {
         let bit = (current ^ previous) & 1;
-        byte |= bit << bit_index;
-        bit_index += 1;
 
-        if bit_index == 8 {
-            extracted.push(byte);
-            byte = 0;
-            bit_index = 0;
+        if let Some(first_bit) = pending_bit.take() {
+            match (first_bit, bit) {
+                (0, 1) => packer.push_bit(0),
+                (1, 0) => packer.push_bit(1),
+                _ => {}
+            }
+        } else {
+            pending_bit = Some(bit);
         }
     }
 
-    if bit_index != 0 {
-        extracted.push(byte);
+    packer.finish()
+}
+
+struct BitPacker {
+    bytes: Vec<u8>,
+    byte: u8,
+    bit_index: u8,
+}
+
+impl BitPacker {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            byte: 0,
+            bit_index: 0,
+        }
     }
 
-    extracted
+    fn push_bit(&mut self, bit: u8) {
+        self.byte |= (bit & 1) << self.bit_index;
+        self.bit_index += 1;
+
+        if self.bit_index == 8 {
+            self.bytes.push(self.byte);
+            self.byte = 0;
+            self.bit_index = 0;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bit_index != 0 {
+            self.bytes.push(self.byte);
+        }
+
+        self.bytes
+    }
 }
 
 fn spawn_camera_worker(
