@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 eframe = "0.34.3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
+rayon = "1.12.0"

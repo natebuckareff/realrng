@@ -1,12 +1,20 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError, TrySendError},
+    },
+    time::{Duration, Instant},
+};
 
 use eframe::egui;
 use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraInfo, RequestedFormat, RequestedFormatType},
+    utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType},
 };
+use rayon::prelude::*;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -51,16 +59,32 @@ struct WebcamWindow {
     diff_default_pos: egui::Pos2,
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
-    camera: Option<Camera>,
+    stream: Option<CameraStream>,
     texture: Option<egui::TextureHandle>,
     diff_texture: Option<egui::TextureHandle>,
-    previous_frame: Option<RgbFrame>,
     status: String,
 }
 
 struct RgbFrame {
     size: [usize; 2],
     pixels: Vec<u8>,
+}
+
+struct CameraStream {
+    stop_signal: Arc<AtomicBool>,
+    receiver: Receiver<StreamMessage>,
+}
+
+struct ProcessedFrame {
+    size: [usize; 2],
+    pixels: Vec<u8>,
+    diff_pixels: Option<Vec<u8>>,
+}
+
+enum StreamMessage {
+    Status(String),
+    Frame(ProcessedFrame),
+    Error(String),
 }
 
 impl WebcamWindow {
@@ -70,10 +94,9 @@ impl WebcamWindow {
             diff_default_pos: egui::pos2(600.0, 56.0),
             devices: Vec::new(),
             selected_device: None,
-            camera: None,
+            stream: None,
             texture: None,
             diff_texture: None,
-            previous_frame: None,
             status: String::new(),
         };
 
@@ -82,8 +105,8 @@ impl WebcamWindow {
     }
 
     fn show(&mut self, ctx: &egui::Context) {
-        if self.camera.is_some() {
-            self.update_frame_textures(ctx);
+        if self.stream.is_some() {
+            self.drain_stream_messages(ctx);
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -117,7 +140,7 @@ impl WebcamWindow {
                     }
 
                     if ui
-                        .add_enabled(self.camera.is_some(), egui::Button::new("Stop camera"))
+                        .add_enabled(self.stream.is_some(), egui::Button::new("Stop camera"))
                         .clicked()
                     {
                         self.stop_camera();
@@ -234,75 +257,78 @@ impl WebcamWindow {
             self.status = "Selected camera is no longer available.".to_owned();
             return;
         };
+        let camera_index = device.index().clone();
+        let camera_label = device_label(device);
 
-        let requested =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        self.stop_camera();
 
-        match Camera::new(device.index().clone(), requested) {
-            Ok(mut camera) => match camera.open_stream() {
-                Ok(()) => {
-                    let format = camera.camera_format();
-                    self.camera = Some(camera);
-                    self.texture = None;
-                    self.diff_texture = None;
-                    self.previous_frame = None;
-                    self.status = format!(
-                        "Streaming {} at {}x{} {} FPS.",
-                        device_label(device),
-                        format.width(),
-                        format.height(),
-                        format.frame_rate()
-                    );
-                }
-                Err(error) => {
-                    self.camera = None;
-                    self.texture = None;
-                    self.diff_texture = None;
-                    self.previous_frame = None;
-                    self.status = format!("Could not open camera stream: {error}");
-                }
-            },
-            Err(error) => {
-                self.camera = None;
-                self.texture = None;
-                self.diff_texture = None;
-                self.previous_frame = None;
-                self.status = format!("Could not create camera: {error}");
-            }
-        }
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let stop_signal = Arc::new(AtomicBool::new(false));
+
+        spawn_camera_worker(camera_index, camera_label, stop_signal.clone(), sender);
+
+        self.stream = Some(CameraStream {
+            stop_signal,
+            receiver,
+        });
+        self.texture = None;
+        self.diff_texture = None;
+        self.status = "Starting camera...".to_owned();
     }
 
     fn stop_camera(&mut self) {
-        self.camera = None;
+        if let Some(stream) = self.stream.take() {
+            stream.stop_signal.store(true, Ordering::Relaxed);
+        }
+
         self.texture = None;
         self.diff_texture = None;
-        self.previous_frame = None;
     }
 
-    fn update_frame_textures(&mut self, ctx: &egui::Context) {
-        let Some(camera) = self.camera.as_mut() else {
-            return;
-        };
+    fn drain_stream_messages(&mut self, ctx: &egui::Context) {
+        let mut disconnected = false;
+        let mut latest_frame = None;
 
-        let frame = match camera.frame() {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.status = format!("Could not read frame: {error}");
-                return;
+        for _ in 0..8 {
+            let Some(message) =
+                self.stream
+                    .as_ref()
+                    .and_then(|stream| match stream.receiver.try_recv() {
+                        Ok(message) => Some(message),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            None
+                        }
+                    })
+            else {
+                break;
+            };
+
+            match message {
+                StreamMessage::Status(status) => self.status = status,
+                StreamMessage::Frame(frame) => latest_frame = Some(frame),
+                StreamMessage::Error(error) => {
+                    self.status = error;
+                    self.stream = None;
+                    self.texture = None;
+                    self.diff_texture = None;
+                    break;
+                }
             }
-        };
+        }
 
-        let decoded = match frame.decode_image::<RgbFormat>() {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                self.status = format!("Could not decode frame: {error}");
-                return;
-            }
-        };
+        if let Some(frame) = latest_frame {
+            self.upload_processed_frame(ctx, frame);
+        }
 
-        let size = [decoded.width() as usize, decoded.height() as usize];
-        let current_pixels = decoded.as_raw().to_vec();
-        let image = egui::ColorImage::from_rgb(size, &current_pixels);
+        if disconnected {
+            self.stream = None;
+        }
+    }
+
+    fn upload_processed_frame(&mut self, ctx: &egui::Context, frame: ProcessedFrame) {
+        let image = egui::ColorImage::from_rgb(frame.size, &frame.pixels);
 
         if let Some(texture) = self.texture.as_mut() {
             texture.set(image, egui::TextureOptions::LINEAR);
@@ -311,39 +337,147 @@ impl WebcamWindow {
                 Some(ctx.load_texture("webcam_frame", image, egui::TextureOptions::LINEAR));
         }
 
-        if let Some(previous_frame) = &self.previous_frame {
-            if previous_frame.size == size && previous_frame.pixels.len() == current_pixels.len() {
-                let diff_pixels =
-                    absolute_frame_difference(&current_pixels, &previous_frame.pixels);
-                let diff_image = egui::ColorImage::from_rgb(size, &diff_pixels);
+        if let Some(diff_pixels) = frame.diff_pixels {
+            let diff_image = egui::ColorImage::from_rgb(frame.size, &diff_pixels);
 
-                if let Some(texture) = self.diff_texture.as_mut() {
-                    texture.set(diff_image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.diff_texture = Some(ctx.load_texture(
-                        "webcam_frame_difference",
-                        diff_image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
+            if let Some(texture) = self.diff_texture.as_mut() {
+                texture.set(diff_image, egui::TextureOptions::LINEAR);
             } else {
-                self.diff_texture = None;
+                self.diff_texture = Some(ctx.load_texture(
+                    "webcam_frame_difference",
+                    diff_image,
+                    egui::TextureOptions::LINEAR,
+                ));
             }
+        } else {
+            self.diff_texture = None;
         }
-
-        self.previous_frame = Some(RgbFrame {
-            size,
-            pixels: current_pixels,
-        });
     }
 }
 
 fn absolute_frame_difference(current: &[u8], previous: &[u8]) -> Vec<u8> {
     current
-        .iter()
-        .zip(previous)
+        .par_iter()
+        .zip(previous.par_iter())
         .map(|(current, previous)| current.abs_diff(*previous))
         .collect()
+}
+
+fn spawn_camera_worker(
+    index: CameraIndex,
+    label: String,
+    stop_signal: Arc<AtomicBool>,
+    sender: mpsc::SyncSender<StreamMessage>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("camera-worker".to_owned())
+        .spawn(move || {
+            run_camera_worker(index, label, stop_signal, sender);
+        });
+}
+
+fn run_camera_worker(
+    index: CameraIndex,
+    label: String,
+    stop_signal: Arc<AtomicBool>,
+    sender: mpsc::SyncSender<StreamMessage>,
+) {
+    let requested =
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+
+    let mut camera = match Camera::new(index, requested) {
+        Ok(camera) => camera,
+        Err(error) => {
+            send_stream_message(
+                &sender,
+                StreamMessage::Error(format!("Could not create camera: {error}")),
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = camera.open_stream() {
+        send_stream_message(
+            &sender,
+            StreamMessage::Error(format!("Could not open camera stream: {error}")),
+        );
+        return;
+    }
+
+    let format = camera.camera_format();
+    send_stream_message(
+        &sender,
+        StreamMessage::Status(format!(
+            "Streaming {label} at {}x{} {} FPS.",
+            format.width(),
+            format.height(),
+            format.frame_rate()
+        )),
+    );
+
+    let mut previous_frame: Option<RgbFrame> = None;
+
+    while !stop_signal.load(Ordering::Relaxed) {
+        let frame_started_at = Instant::now();
+
+        let frame = match camera.frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                send_stream_message(
+                    &sender,
+                    StreamMessage::Error(format!("Could not read frame: {error}")),
+                );
+                return;
+            }
+        };
+
+        let decoded = match frame.decode_image::<RgbFormat>() {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                send_stream_message(
+                    &sender,
+                    StreamMessage::Error(format!("Could not decode frame: {error}")),
+                );
+                return;
+            }
+        };
+
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let current_pixels = decoded.as_raw().to_vec();
+
+        let diff_pixels = previous_frame.as_ref().and_then(|previous| {
+            if previous.size == size && previous.pixels.len() == current_pixels.len() {
+                Some(absolute_frame_difference(&current_pixels, &previous.pixels))
+            } else {
+                None
+            }
+        });
+
+        previous_frame = Some(RgbFrame {
+            size,
+            pixels: current_pixels.clone(),
+        });
+
+        send_stream_message(
+            &sender,
+            StreamMessage::Frame(ProcessedFrame {
+                size,
+                pixels: current_pixels,
+                diff_pixels,
+            }),
+        );
+
+        let elapsed = frame_started_at.elapsed();
+        if elapsed < Duration::from_millis(16) {
+            std::thread::sleep(Duration::from_millis(16) - elapsed);
+        }
+    }
+}
+
+fn send_stream_message(sender: &mpsc::SyncSender<StreamMessage>, message: StreamMessage) {
+    match sender.try_send(message) {
+        Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 fn device_label(device: &CameraInfo) -> String {
