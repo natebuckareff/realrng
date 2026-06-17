@@ -91,6 +91,7 @@ struct ProcessedFrame {
     size: [usize; 2],
     pixels: Vec<u8>,
     diff_pixels: Option<Vec<u8>>,
+    extracted_noise_bytes: Option<Vec<u8>>,
 }
 
 enum StreamMessage {
@@ -128,8 +129,8 @@ impl WebcamWindow {
         self.show_difference_window(ctx);
         self.show_chi_square_window(
             ctx,
-            "Raw Difference Chi-Square",
-            "raw_difference_chi_square_window",
+            "LSB Transition Chi-Square",
+            "lsb_transition_chi_square_window",
             self.diff_chi_square_default_pos,
             &self.diff_chi_square,
         );
@@ -379,8 +380,11 @@ impl WebcamWindow {
                 Some(ctx.load_texture("webcam_frame", image, egui::TextureOptions::LINEAR));
         }
 
+        if let Some(extracted_noise_bytes) = &frame.extracted_noise_bytes {
+            self.diff_chi_square.push_bytes(extracted_noise_bytes);
+        }
+
         if let Some(diff_pixels) = frame.diff_pixels {
-            self.diff_chi_square.push_bytes(&diff_pixels);
             let diff_image = egui::ColorImage::from_rgb(frame.size, &diff_pixels);
 
             if let Some(texture) = self.diff_texture.as_mut() {
@@ -569,6 +573,30 @@ fn absolute_frame_difference(current: &[u8], previous: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+fn extract_lsb_transition_bytes(current: &[u8], previous: &[u8]) -> Vec<u8> {
+    let mut extracted = Vec::with_capacity(current.len().div_ceil(8));
+    let mut byte = 0_u8;
+    let mut bit_index = 0;
+
+    for (current, previous) in current.iter().zip(previous) {
+        let bit = (current ^ previous) & 1;
+        byte |= bit << bit_index;
+        bit_index += 1;
+
+        if bit_index == 8 {
+            extracted.push(byte);
+            byte = 0;
+            bit_index = 0;
+        }
+    }
+
+    if bit_index != 0 {
+        extracted.push(byte);
+    }
+
+    extracted
+}
+
 fn spawn_camera_worker(
     index: CameraIndex,
     label: String,
@@ -651,13 +679,20 @@ fn run_camera_worker(
         let size = [decoded.width() as usize, decoded.height() as usize];
         let current_pixels = decoded.as_raw().to_vec();
 
-        let diff_pixels = previous_frame.as_ref().and_then(|previous| {
-            if previous.size == size && previous.pixels.len() == current_pixels.len() {
-                Some(absolute_frame_difference(&current_pixels, &previous.pixels))
-            } else {
-                None
-            }
-        });
+        let (diff_pixels, extracted_noise_bytes) = previous_frame
+            .as_ref()
+            .filter(|previous| {
+                previous.size == size && previous.pixels.len() == current_pixels.len()
+            })
+            .map(|previous| {
+                (
+                    absolute_frame_difference(&current_pixels, &previous.pixels),
+                    extract_lsb_transition_bytes(&current_pixels, &previous.pixels),
+                )
+            })
+            .map_or((None, None), |(diff_pixels, extracted_noise_bytes)| {
+                (Some(diff_pixels), Some(extracted_noise_bytes))
+            });
 
         previous_frame = Some(RgbFrame {
             size,
@@ -670,6 +705,7 @@ fn run_camera_worker(
                 size,
                 pixels: current_pixels,
                 diff_pixels,
+                extracted_noise_bytes,
             }),
         );
 
