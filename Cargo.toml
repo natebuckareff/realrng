@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-blake3 = "1.8.5"
 eframe = "0.34.3"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
 rayon = "1.12.0"
