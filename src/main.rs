@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,6 +16,9 @@ use nokhwa::{
     utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType},
 };
 use rayon::prelude::*;
+
+const RANDOM_OUTPUT_BYTES_PER_DIFF: usize = 32;
+const RANDOM_HISTORY_LIMIT: usize = 2048;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -57,11 +61,13 @@ impl eframe::App for WorkspaceApp {
 struct WebcamWindow {
     default_pos: egui::Pos2,
     diff_default_pos: egui::Pos2,
+    random_default_pos: egui::Pos2,
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
     stream: Option<CameraStream>,
     texture: Option<egui::TextureHandle>,
     diff_texture: Option<egui::TextureHandle>,
+    random_history: VecDeque<u8>,
     status: String,
 }
 
@@ -79,6 +85,7 @@ struct ProcessedFrame {
     size: [usize; 2],
     pixels: Vec<u8>,
     diff_pixels: Option<Vec<u8>>,
+    random_bytes: Option<Vec<u8>>,
 }
 
 enum StreamMessage {
@@ -92,11 +99,13 @@ impl WebcamWindow {
         let mut webcam = Self {
             default_pos: egui::pos2(48.0, 56.0),
             diff_default_pos: egui::pos2(600.0, 56.0),
+            random_default_pos: egui::pos2(48.0, 520.0),
             devices: Vec::new(),
             selected_device: None,
             stream: None,
             texture: None,
             diff_texture: None,
+            random_history: VecDeque::with_capacity(RANDOM_HISTORY_LIMIT),
             status: String::new(),
         };
 
@@ -112,6 +121,7 @@ impl WebcamWindow {
 
         self.show_webcam_window(ctx);
         self.show_difference_window(ctx);
+        self.show_random_window(ctx);
     }
 
     fn show_webcam_window(&mut self, ctx: &egui::Context) {
@@ -180,6 +190,69 @@ impl WebcamWindow {
                     );
                 }
             });
+    }
+
+    fn show_random_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Random Stream")
+            .id(egui::Id::new("random_stream_window"))
+            .default_pos(self.random_default_pos)
+            .default_size([520.0, 260.0])
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                self.random_graph(ui);
+            });
+    }
+
+    fn random_graph(&self, ui: &mut egui::Ui) {
+        let desired_size = egui::vec2(ui.available_width(), 210.0);
+        let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+
+        let grid_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        for fraction in [0.25_f32, 0.5, 0.75] {
+            let y = egui::lerp(rect.bottom()..=rect.top(), fraction);
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, grid_color.linear_multiply(0.45)),
+            );
+        }
+
+        if self.random_history.len() < 2 {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Start a camera to plot BLAKE3 output bytes.",
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().weak_text_color(),
+            );
+            return;
+        }
+
+        let last_index = (self.random_history.len() - 1) as f32;
+        let points = self
+            .random_history
+            .iter()
+            .enumerate()
+            .map(|(idx, byte)| {
+                let x = egui::lerp(rect.left()..=rect.right(), idx as f32 / last_index);
+                let y = egui::lerp(rect.bottom()..=rect.top(), *byte as f32 / 255.0);
+                egui::pos2(x, y)
+            })
+            .collect::<Vec<_>>();
+
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(110, 210, 160)),
+        ));
     }
 
     fn device_selector(&mut self, ui: &mut egui::Ui) {
@@ -273,6 +346,7 @@ impl WebcamWindow {
         });
         self.texture = None;
         self.diff_texture = None;
+        self.random_history.clear();
         self.status = "Starting camera...".to_owned();
     }
 
@@ -283,6 +357,7 @@ impl WebcamWindow {
 
         self.texture = None;
         self.diff_texture = None;
+        self.random_history.clear();
     }
 
     fn drain_stream_messages(&mut self, ctx: &egui::Context) {
@@ -352,6 +427,19 @@ impl WebcamWindow {
         } else {
             self.diff_texture = None;
         }
+
+        if let Some(random_bytes) = frame.random_bytes {
+            self.push_random_bytes(&random_bytes);
+        }
+    }
+
+    fn push_random_bytes(&mut self, random_bytes: &[u8]) {
+        for byte in random_bytes {
+            if self.random_history.len() == RANDOM_HISTORY_LIMIT {
+                self.random_history.pop_front();
+            }
+            self.random_history.push_back(*byte);
+        }
     }
 }
 
@@ -416,6 +504,7 @@ fn run_camera_worker(
     );
 
     let mut previous_frame: Option<RgbFrame> = None;
+    let mut random_hasher = blake3::Hasher::new();
 
     while !stop_signal.load(Ordering::Relaxed) {
         let frame_started_at = Instant::now();
@@ -452,6 +541,14 @@ fn run_camera_worker(
                 None
             }
         });
+        let random_bytes = diff_pixels.as_ref().map(|diff_pixels| {
+            random_hasher.update(diff_pixels);
+
+            let mut output = vec![0_u8; RANDOM_OUTPUT_BYTES_PER_DIFF];
+            let mut output_reader = random_hasher.finalize_xof();
+            output_reader.fill(&mut output);
+            output
+        });
 
         previous_frame = Some(RgbFrame {
             size,
@@ -464,6 +561,7 @@ fn run_camera_worker(
                 size,
                 pixels: current_pixels,
                 diff_pixels,
+                random_bytes,
             }),
         );
 
