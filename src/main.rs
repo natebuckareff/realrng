@@ -48,21 +48,32 @@ impl eframe::App for WorkspaceApp {
 
 struct WebcamWindow {
     default_pos: egui::Pos2,
+    diff_default_pos: egui::Pos2,
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
     camera: Option<Camera>,
     texture: Option<egui::TextureHandle>,
+    diff_texture: Option<egui::TextureHandle>,
+    previous_frame: Option<RgbFrame>,
     status: String,
+}
+
+struct RgbFrame {
+    size: [usize; 2],
+    pixels: Vec<u8>,
 }
 
 impl WebcamWindow {
     fn new() -> Self {
         let mut webcam = Self {
             default_pos: egui::pos2(48.0, 56.0),
+            diff_default_pos: egui::pos2(600.0, 56.0),
             devices: Vec::new(),
             selected_device: None,
             camera: None,
             texture: None,
+            diff_texture: None,
+            previous_frame: None,
             status: String::new(),
         };
 
@@ -72,10 +83,15 @@ impl WebcamWindow {
 
     fn show(&mut self, ctx: &egui::Context) {
         if self.camera.is_some() {
-            self.update_frame_texture(ctx);
+            self.update_frame_textures(ctx);
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
+        self.show_webcam_window(ctx);
+        self.show_difference_window(ctx);
+    }
+
+    fn show_webcam_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Webcam")
             .id(egui::Id::new("webcam_window"))
             .default_pos(self.default_pos)
@@ -114,6 +130,32 @@ impl WebcamWindow {
 
                 ui.separator();
                 self.frame_view(ui);
+            });
+    }
+
+    fn show_difference_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Frame Difference")
+            .id(egui::Id::new("frame_difference_window"))
+            .default_pos(self.diff_default_pos)
+            .default_size([520.0, 420.0])
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                if let Some(texture) = &self.diff_texture {
+                    ui.add(
+                        egui::Image::from_texture(texture)
+                            .max_size(egui::vec2(ui.available_width(), 380.0))
+                            .shrink_to_fit(),
+                    );
+                } else {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 280.0),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.label("Start a camera to show frame differences here.");
+                        },
+                    );
+                }
             });
     }
 
@@ -202,6 +244,8 @@ impl WebcamWindow {
                     let format = camera.camera_format();
                     self.camera = Some(camera);
                     self.texture = None;
+                    self.diff_texture = None;
+                    self.previous_frame = None;
                     self.status = format!(
                         "Streaming {} at {}x{} {} FPS.",
                         device_label(device),
@@ -213,12 +257,16 @@ impl WebcamWindow {
                 Err(error) => {
                     self.camera = None;
                     self.texture = None;
+                    self.diff_texture = None;
+                    self.previous_frame = None;
                     self.status = format!("Could not open camera stream: {error}");
                 }
             },
             Err(error) => {
                 self.camera = None;
                 self.texture = None;
+                self.diff_texture = None;
+                self.previous_frame = None;
                 self.status = format!("Could not create camera: {error}");
             }
         }
@@ -227,9 +275,11 @@ impl WebcamWindow {
     fn stop_camera(&mut self) {
         self.camera = None;
         self.texture = None;
+        self.diff_texture = None;
+        self.previous_frame = None;
     }
 
-    fn update_frame_texture(&mut self, ctx: &egui::Context) {
+    fn update_frame_textures(&mut self, ctx: &egui::Context) {
         let Some(camera) = self.camera.as_mut() else {
             return;
         };
@@ -251,7 +301,8 @@ impl WebcamWindow {
         };
 
         let size = [decoded.width() as usize, decoded.height() as usize];
-        let image = egui::ColorImage::from_rgb(size, decoded.as_raw());
+        let current_pixels = decoded.as_raw().to_vec();
+        let image = egui::ColorImage::from_rgb(size, &current_pixels);
 
         if let Some(texture) = self.texture.as_mut() {
             texture.set(image, egui::TextureOptions::LINEAR);
@@ -259,7 +310,40 @@ impl WebcamWindow {
             self.texture =
                 Some(ctx.load_texture("webcam_frame", image, egui::TextureOptions::LINEAR));
         }
+
+        if let Some(previous_frame) = &self.previous_frame {
+            if previous_frame.size == size && previous_frame.pixels.len() == current_pixels.len() {
+                let diff_pixels =
+                    absolute_frame_difference(&current_pixels, &previous_frame.pixels);
+                let diff_image = egui::ColorImage::from_rgb(size, &diff_pixels);
+
+                if let Some(texture) = self.diff_texture.as_mut() {
+                    texture.set(diff_image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.diff_texture = Some(ctx.load_texture(
+                        "webcam_frame_difference",
+                        diff_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            } else {
+                self.diff_texture = None;
+            }
+        }
+
+        self.previous_frame = Some(RgbFrame {
+            size,
+            pixels: current_pixels,
+        });
     }
+}
+
+fn absolute_frame_difference(current: &[u8], previous: &[u8]) -> Vec<u8> {
+    current
+        .iter()
+        .zip(previous)
+        .map(|(current, previous)| current.abs_diff(*previous))
+        .collect()
 }
 
 fn device_label(device: &CameraInfo) -> String {
