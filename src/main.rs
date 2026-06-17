@@ -13,12 +13,23 @@ use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType},
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, CameraInfo, FrameFormat, RequestedFormat,
+        RequestedFormatType,
+    },
 };
 use rayon::prelude::*;
 
 const CHI_SQUARE_CHUNK_SIZE: usize = 4096;
 const CHI_SQUARE_HISTORY_LIMIT: usize = 256;
+const SOURCE_FRAME_FORMATS: [FrameFormat; 6] = [
+    FrameFormat::YUYV,
+    FrameFormat::MJPEG,
+    FrameFormat::NV12,
+    FrameFormat::GRAY,
+    FrameFormat::RAWRGB,
+    FrameFormat::RAWBGR,
+];
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -64,6 +75,7 @@ struct WebcamWindow {
     diff_chi_square_default_pos: egui::Pos2,
     devices: Vec<CameraInfo>,
     selected_device: Option<usize>,
+    selected_frame_format: FrameFormat,
     stream: Option<CameraStream>,
     texture: Option<egui::TextureHandle>,
     diff_texture: Option<egui::TextureHandle>,
@@ -108,6 +120,7 @@ impl WebcamWindow {
             diff_chi_square_default_pos: egui::pos2(600.0, 520.0),
             devices: Vec::new(),
             selected_device: None,
+            selected_frame_format: FrameFormat::YUYV,
             stream: None,
             texture: None,
             diff_texture: None,
@@ -146,6 +159,10 @@ impl WebcamWindow {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     self.device_selector(ui);
+
+                    ui.add_enabled_ui(self.stream.is_none(), |ui| {
+                        self.format_selector(ui);
+                    });
 
                     if ui.button("Refresh").clicked() {
                         self.refresh_devices();
@@ -245,6 +262,21 @@ impl WebcamWindow {
             });
     }
 
+    fn format_selector(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_id_salt("webcam_format_selector")
+            .selected_text(self.selected_frame_format.to_string())
+            .width(96.0)
+            .show_ui(ui, |ui| {
+                for format in SOURCE_FRAME_FORMATS {
+                    ui.selectable_value(
+                        &mut self.selected_frame_format,
+                        format,
+                        format.to_string(),
+                    );
+                }
+            });
+    }
+
     fn frame_view(&self, ui: &mut egui::Ui) {
         if let Some(texture) = &self.texture {
             ui.add(
@@ -300,13 +332,20 @@ impl WebcamWindow {
         };
         let camera_index = device.index().clone();
         let camera_label = device_label(device);
+        let frame_format = self.selected_frame_format;
 
         self.stop_camera();
 
         let (sender, receiver) = mpsc::sync_channel(2);
         let stop_signal = Arc::new(AtomicBool::new(false));
 
-        spawn_camera_worker(camera_index, camera_label, stop_signal.clone(), sender);
+        spawn_camera_worker(
+            camera_index,
+            camera_label,
+            frame_format,
+            stop_signal.clone(),
+            sender,
+        );
 
         self.stream = Some(CameraStream {
             stop_signal,
@@ -632,24 +671,25 @@ impl BitPacker {
 fn spawn_camera_worker(
     index: CameraIndex,
     label: String,
+    source_format: FrameFormat,
     stop_signal: Arc<AtomicBool>,
     sender: mpsc::SyncSender<StreamMessage>,
 ) {
     let _ = std::thread::Builder::new()
         .name("camera-worker".to_owned())
         .spawn(move || {
-            run_camera_worker(index, label, stop_signal, sender);
+            run_camera_worker(index, label, source_format, stop_signal, sender);
         });
 }
 
 fn run_camera_worker(
     index: CameraIndex,
     label: String,
+    source_format: FrameFormat,
     stop_signal: Arc<AtomicBool>,
     sender: mpsc::SyncSender<StreamMessage>,
 ) {
-    let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let requested = RequestedFormat::with_formats(RequestedFormatType::None, &SOURCE_FRAME_FORMATS);
 
     let mut camera = match Camera::new(index, requested) {
         Ok(camera) => camera,
@@ -661,6 +701,45 @@ fn run_camera_worker(
             return;
         }
     };
+
+    match camera.compatible_camera_formats() {
+        Ok(formats) => {
+            let Some(format) = best_source_format(&formats, source_format) else {
+                send_stream_message(
+                    &sender,
+                    StreamMessage::Error(format!(
+                        "Selected camera does not report any {source_format} formats."
+                    )),
+                );
+                return;
+            };
+
+            let accepted_formats = [source_format];
+            let requested_format = RequestedFormat::with_formats(
+                RequestedFormatType::Exact(format),
+                &accepted_formats,
+            );
+            if let Err(error) = camera.set_camera_requset(requested_format) {
+                send_stream_message(
+                    &sender,
+                    StreamMessage::Error(format!(
+                        "Could not set {source_format} camera format: {error}"
+                    )),
+                );
+                return;
+            }
+        }
+        Err(error) if camera.camera_format().format() != source_format => {
+            send_stream_message(
+                &sender,
+                StreamMessage::Error(format!(
+                    "Could not choose {source_format} camera format: {error}"
+                )),
+            );
+            return;
+        }
+        Err(_) => {}
+    }
 
     if let Err(error) = camera.open_stream() {
         send_stream_message(
@@ -674,10 +753,11 @@ fn run_camera_worker(
     send_stream_message(
         &sender,
         StreamMessage::Status(format!(
-            "Streaming {label} at {}x{} {} FPS.",
+            "Streaming {label} at {}x{} {} FPS, {} source.",
             format.width(),
             format.height(),
-            format.frame_rate()
+            format.frame_rate(),
+            format.format()
         )),
     );
 
@@ -746,6 +826,17 @@ fn run_camera_worker(
             std::thread::sleep(Duration::from_millis(16) - elapsed);
         }
     }
+}
+
+fn best_source_format(
+    formats: &[CameraFormat],
+    source_format: FrameFormat,
+) -> Option<CameraFormat> {
+    formats
+        .iter()
+        .copied()
+        .filter(|format| format.format() == source_format)
+        .max_by_key(|format| (format.frame_rate(), format.resolution()))
 }
 
 fn send_stream_message(sender: &mpsc::SyncSender<StreamMessage>, message: StreamMessage) {
