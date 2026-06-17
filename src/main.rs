@@ -35,7 +35,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("egui Workspace")
-            .with_inner_size([900.0, 600.0]),
+            .with_inner_size([1240.0, 900.0]),
         ..Default::default()
     };
 
@@ -153,8 +153,8 @@ impl WebcamWindow {
     fn new() -> Self {
         let mut webcam = Self {
             default_pos: egui::pos2(48.0, 56.0),
-            diff_default_pos: egui::pos2(600.0, 56.0),
-            diff_chi_square_default_pos: egui::pos2(600.0, 520.0),
+            diff_default_pos: egui::pos2(648.0, 60.0),
+            diff_chi_square_default_pos: egui::pos2(78.0, 556.0),
             devices: Vec::new(),
             selected_device: None,
             selected_frame_format: FrameFormat::YUYV,
@@ -241,7 +241,7 @@ impl WebcamWindow {
         egui::Window::new("Frame Difference")
             .id(egui::Id::new("frame_difference_window"))
             .default_pos(self.diff_default_pos)
-            .default_size([520.0, 420.0])
+            .default_size([520.0, 320.0])
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
